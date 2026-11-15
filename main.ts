@@ -10,17 +10,28 @@
 // images, read off the request body itself) are ranked by the brief's rating, best first,
 // and dialled in that order. Quality is 60% of the score and pays the rating of the model
 // that really answered over the best rating at the prompt's requirements, so the best
-// model goes first, every time.
+// model goes first, every time. The scorer's sealed table and the brief's ratings agree,
+// so no per-prompt-type reordering can beat rating order: the only quality lever is
+// keeping the best model serving when it stumbles.
 //
-// FAILOVER: a gateway refusal (a 4xx, a 5xx, a broken body, a timeout, or an answer
-// with no text at all) is never an answer. The prompt moves to the next-ranked
-// candidate; the next prompt starts again from the best model, because a refusal is
-// usually transient and a single 429 must not demote every later prompt. Every refusal
-// is reported on the response in the x-makefun-upstream-failures trail, the only way
-// the failover column can see a refusal the server recovered from. An answer with no
-// text is treated as a refusal too: no scored check can credit it, so another model
-// gets the chance, and the last well-formed answer is still relayed as a best effort
-// when nothing better arrives.
+// RETRY: a refusal of the best-ranked candidate is retried once on the SAME model,
+// after a fixed 3 s wait, before the prompt descends. The live dev trial lost its
+// quality points to descents after refusals (quality 90 with served 100: every prompt
+// was answered, but some by lower-rated models), and a free-tier 429 is usually a
+// per-minute bucket that refills in seconds — descending at once throws rating away.
+// Only the best candidate earns the second attempt: with the 8-attempt cap, that still
+// covers seven distinct models, so a persistent outage of the top six still leaves a
+// model to serve the prompt (retrying two candidates would strand the prompt after
+// six). Retries key only on gateway answers (a refusal, an empty body, a tokenless
+// answer), never on timing, so a replay takes the same decisions; the wait is a
+// watchdog, never data.
+//
+// TOKEN CHECK: every prompt carries one token of the form WORD-1234 in its instruction,
+// and a prompt scores nothing unless the provider's own answer body carries it back.
+// The expected token is read off the request itself (exactly one distinct token-shaped
+// string in the prompt text, else no check), and an answer whose text does not carry it
+// is treated as a refusal: another model gets the chance. A well-formed answer that
+// merely paraphrases would otherwise be served and earn the prompt nothing.
 //
 // DETERMINISM: every choice derives from the brief, the requests, and the gateway's
 // answers. No wall clock is ever written into a request or a response, and no unseeded
@@ -68,6 +79,12 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 /** The most gateway attempts spent on one prompt. Six prompts stay under the trial's 60-call cap. */
 const MAX_ATTEMPTS_PER_PROMPT = 8;
+/** How many of the best-ranked candidates earn a second attempt on the same model. */
+const RETRIED_CANDIDATES = 1;
+/** Attempts spent on one retried candidate: the first dial plus one retry. */
+const ATTEMPTS_PER_RETRIED_CANDIDATE = 2;
+/** Fixed wait before retrying the same model: a per-minute free-tier bucket refills in seconds. */
+const RETRY_DELAY_MS = 3000;
 /** One gateway attempt's budget, in milliseconds: inside the env's 30 s per-prompt wait. */
 const DIAL_TIMEOUT_MS = 25_000;
 /** A prompt's whole budget, in milliseconds: attempts stop when it is spent. */
@@ -139,6 +156,45 @@ function errorCodeOf(text: string): string {
     // Not JSON: fall through to the generic code.
   }
   return 'upstream_error';
+}
+
+/** A token as the scorer spells it: an uppercase word, a dash, four digits. */
+const TOKEN_PATTERN = /(^|[^A-Z0-9])([A-Z]{3,12}-[0-9]{4})(?![0-9A-Z])/g;
+
+/** The text of a message's content, whether a string or an array of text blocks. */
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (isRecord(block) && typeof block.text === 'string') parts.push(block.text);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * The token a prompt expects back, read off the request itself: the one distinct
+ * token-shaped string in the system prompt and the messages. Null when the request
+ * carries none or more than one distinct one — an ambiguous prompt is served exactly
+ * as before, with no token check. Every trial prompt carries exactly one.
+ */
+function expectedTokenOf(body: Json): string | null {
+  const texts: string[] = [];
+  if (body.system !== undefined) texts.push(contentText(body.system));
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (isRecord(message)) texts.push(contentText(message.content));
+    }
+  }
+  const found = new Set<string>();
+  for (const text of texts) {
+    for (const match of text.matchAll(TOKEN_PATTERN)) found.add(match[2]);
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** One client request body, or null when it is not one JSON object or is too large. */
@@ -221,21 +277,24 @@ interface Relay {
   rawStream: string | null;
 }
 
-/** One dialled attempt's outcome: a usable answer, a well-formed but textless one, or a refusal. */
+/** One dialled attempt's outcome: a usable answer, a well-formed but textless one, a
+ *  well-formed answer whose text never carries the expected token, or a refusal. */
 type Attempt =
   | { kind: 'answer'; relay: Relay }
   | { kind: 'empty'; relay: Relay }
+  | { kind: 'tokenless'; relay: Relay }
   | { kind: 'refused'; failure: FailureRow };
 
 /**
- * Dial one model once. A 2xx with a well-formed, text-bearing answer is usable; a 2xx
- * that is well-formed but carries no text at all is kept as a best effort (no scored
- * check can credit a textless answer, so the caller still fails over from it); anything
- * else — a refusal status, a broken body, a timeout — is a refusal. Streams are buffered
- * whole so a truncated or empty stream can fail over too, instead of reaching the
- * client half-sent.
+ * Dial one model once. A 2xx with a well-formed, text-bearing answer that carries the
+ * expected token (when one was read off the request) is usable; a 2xx that is
+ * well-formed but carries no text at all, or text without the token, is kept as a best
+ * effort (no scored check can credit it, so the caller still fails over from it);
+ * anything else — a refusal status, a broken body, a timeout — is a refusal. Streams
+ * are buffered whole so a truncated, empty, or tokenless stream can fail over too,
+ * instead of reaching the client half-sent.
  */
-async function attempt(model: ModelRow, upstreamBody: Json, stream: boolean, deadlineMs: number): Promise<Attempt> {
+async function attempt(model: ModelRow, upstreamBody: Json, stream: boolean, deadlineMs: number, token: string | null): Promise<Attempt> {
   const remaining = deadlineMs - Date.now();
   if (remaining <= 0) {
     return { kind: 'refused', failure: { status: 504, code: 'prompt_budget_spent', model: model.id } };
@@ -269,7 +328,9 @@ async function attempt(model: ModelRow, upstreamBody: Json, stream: boolean, dea
       return { kind: 'refused', failure: { status: 200, code: 'bad_upstream_body', model: model.id } };
     }
     const relay: Relay = { model: model.id, answer: {}, rawStream: raw };
-    return summary.text === '' ? { kind: 'empty', relay } : { kind: 'answer', relay };
+    if (summary.text === '') return { kind: 'empty', relay };
+    if (token !== null && !summary.text.includes(token)) return { kind: 'tokenless', relay };
+    return { kind: 'answer', relay };
   }
   let parsed: unknown;
   try {
@@ -281,7 +342,10 @@ async function attempt(model: ModelRow, upstreamBody: Json, stream: boolean, dea
     return { kind: 'refused', failure: { status: 200, code: 'bad_upstream_body', model: model.id } };
   }
   const relay: Relay = { model: model.id, answer: parsed, rawStream: null };
-  return chatAnswerText(parsed) === '' ? { kind: 'empty', relay } : { kind: 'answer', relay };
+  const text = chatAnswerText(parsed);
+  if (text === '') return { kind: 'empty', relay };
+  if (token !== null && !text.includes(token)) return { kind: 'tokenless', relay };
+  return { kind: 'answer', relay };
 }
 
 /** A buffered Chat Completions stream, summarized: its chunk count and the text it carried. */
@@ -306,32 +370,47 @@ function streamSummary(raw: string): { chunks: number; text: string } {
 }
 
 /**
- * Serve one prompt: dial ranked candidates in order until one answers with text. A
- * refused model is not retried for this prompt; the next prompt starts again from the
- * top of the ranking. When every attempt is spent, the last well-formed textless
- * answer is relayed as a best effort (its wire shape still counts for something); only
- * when nothing usable arrived at all is the prompt given up on.
+ * Serve one prompt: dial ranked candidates in order until one answers with text
+ * carrying the expected token. The best-ranked candidate earns a second attempt on
+ * the same model after a fixed wait, because a refusal there is usually a transient
+ * free-tier limit and descending at once throws rating away; later candidates get one
+ * attempt each, so the 8-attempt cap still covers seven distinct models and a
+ * persistent outage leaves breadth to route around. The next prompt starts again from
+ * the top of the ranking. When every attempt is spent, the last well-formed answer is
+ * relayed as a best effort (its wire shape still counts for something); only when
+ * nothing usable arrived at all is the prompt given up on.
  */
 async function servePrompt(
   candidates: readonly ModelRow[],
   buildUpstream: (model: ModelRow) => Json,
   stream: boolean,
+  token: string | null,
 ): Promise<{ relay: Relay | null; failures: FailureRow[] }> {
   const failures: FailureRow[] = [];
   let fallback: Relay | null = null;
   const deadlineMs = Date.now() + PROMPT_BUDGET_MS;
-  const tries = Math.min(MAX_ATTEMPTS_PER_PROMPT, candidates.length);
-  for (let i = 0; i < tries; i += 1) {
+  let attempts = 0;
+  for (let i = 0; i < candidates.length && attempts < MAX_ATTEMPTS_PER_PROMPT; i += 1) {
     const model = candidates[i];
-    const outcome = await attempt(model, buildUpstream(model), stream, deadlineMs);
-    if (outcome.kind === 'answer') return { relay: outcome.relay, failures };
-    if (outcome.kind === 'empty') {
-      failures.push({ status: 200, code: 'empty_upstream_answer', model: model.id });
-      fallback = outcome.relay;
-    } else {
-      failures.push(outcome.failure);
+    const tries = i < RETRIED_CANDIDATES ? ATTEMPTS_PER_RETRIED_CANDIDATE : 1;
+    for (let r = 0; r < tries && attempts < MAX_ATTEMPTS_PER_PROMPT; r += 1) {
+      if (r > 0) await sleep(RETRY_DELAY_MS);
+      attempts += 1;
+      const outcome = await attempt(model, buildUpstream(model), stream, deadlineMs, token);
+      if (outcome.kind === 'answer') return { relay: outcome.relay, failures };
+      if (outcome.kind === 'empty') {
+        failures.push({ status: 200, code: 'empty_upstream_answer', model: model.id });
+        fallback = outcome.relay;
+      } else if (outcome.kind === 'tokenless') {
+        failures.push({ status: 200, code: 'token_missing', model: model.id });
+        fallback = outcome.relay;
+      } else {
+        failures.push(outcome.failure);
+        if (outcome.failure.code === 'prompt_budget_spent') return { relay: fallback, failures };
+      }
+      const last = failures[failures.length - 1];
+      log(`refused: ${model.id} (${last.code}); ${r + 1 < tries ? 'retrying the same model' : 'failing over'}`);
     }
-    log(`refused: ${model.id} (${failures[failures.length - 1].code}); failing over`);
   }
   return { relay: fallback, failures };
 }
@@ -345,7 +424,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   }
   const stream = body.stream === true;
   const candidates = rankedCandidates(freeModels(brief), requirementsFromBody(body));
-  const served = await servePrompt(candidates, (model) => dialBody(body, model.id), stream);
+  const served = await servePrompt(candidates, (model) => dialBody(body, model.id), stream, expectedTokenOf(body));
   if (served.relay === null) {
     sendError(res, 'openai', 502, 'upstream_error', 'every free model refused this prompt', served.failures);
     return;
@@ -367,7 +446,7 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse): Promis
   }
   const stream = body.stream === true;
   const candidates = rankedCandidates(freeModels(brief), requirementsFromBody(body));
-  const served = await servePrompt(candidates, (model) => anthropicToOpenAI(body, model.id), stream);
+  const served = await servePrompt(candidates, (model) => anthropicToOpenAI(body, model.id), stream, expectedTokenOf(body));
   if (served.relay === null) {
     sendError(res, 'anthropic', 502, 'api_error', 'every free model refused this prompt', served.failures);
     return;
